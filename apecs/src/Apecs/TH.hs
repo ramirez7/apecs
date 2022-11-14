@@ -3,8 +3,11 @@
 
 module Apecs.TH
   ( makeWorld
+  , makeWorldFixed
   , makeWorldNoEC
+  , makeWorldFixedNoEC
   , makeWorldAndComponents
+  , makeWorldAndComponentsFixed
   , makeMapComponents
   , makeMapComponentsFor
   ) where
@@ -53,6 +56,49 @@ makeWorldNoEC worldName cTypes = do
 
   return $ wldDecl : initSig : initDecl : hasDecl
 
+makeWorldFixedNoEC :: String -> [Name] -> Q [Dec]
+makeWorldFixedNoEC worldName cTypes = do
+  cTypesNamesKinds <- forM cTypes $ \t -> do
+    rec <- genName "rec"
+    k <- reifyType t
+    return (ConT t, k, rec)
+
+  let wld = mkName worldName
+      has = mkName "Has"
+      sys = mkName "SystemT"
+      m = VarT $ mkName "m"
+      wldDecl = DataD [] wld [] Nothing [RecC wld records] []
+
+      makeRecord (t, k, n) = case k of
+        StarT -> (n, Bang NoSourceUnpackedness SourceStrict, ConT (mkName "Storage") `AppT` t)
+        AppT (AppT ArrowT StarT) StarT -> (n, Bang NoSourceUnpackedness SourceStrict, ConT (mkName "Storage") `AppT` (AppT t (ConT wld)))
+        _ -> error $ unwords ["Invalid component type for:", pprint t, "::", pprint k]
+      records = makeRecord <$> cTypesNamesKinds
+
+      makeInstance (t,k,n) = case k of
+        StarT ->
+          InstanceD Nothing [ConT (mkName "Monad") `AppT` m] (ConT has `AppT` ConT wld `AppT` m `AppT` t)
+            [ FunD (mkName "getStore") [Clause []
+                (NormalB$ ConE sys `AppE` (VarE (mkName "asks") `AppE` VarE n))
+              [] ]
+            ]
+        AppT (AppT ArrowT StarT) StarT ->
+          InstanceD Nothing [ConT (mkName "Monad") `AppT` m] (ConT has `AppT` ConT wld `AppT` m `AppT` (AppT t (ConT wld)))
+            [ FunD (mkName "getStore") [Clause []
+                (NormalB$ ConE sys `AppE` (VarE (mkName "asks") `AppE` VarE n))
+              [] ]
+            ]
+        _ -> error $ unwords ["Invalid component type for:", pprint t, "::", pprint k]
+      initWorldName = mkName $ "init" ++ worldName
+      initSig = SigD initWorldName (AppT (ConT (mkName "IO")) (ConT wld))
+      initDecl = FunD initWorldName [Clause []
+        (NormalB$ iterate (\wE -> AppE (AppE (VarE $ mkName "<*>") wE) (VarE $ mkName "explInit")) (AppE (VarE $ mkName "return") (ConE wld)) !! length records)
+        [] ]
+
+      hasDecl = makeInstance <$> cTypesNamesKinds
+
+  return $ wldDecl : initSig : initDecl : hasDecl
+
 -- | Creates 'Component' instances with 'Map' stores
 makeMapComponents :: [Name] -> Q [Dec]
 makeMapComponents = mapM makeMapComponent
@@ -65,7 +111,14 @@ makeMapComponentFor :: Name -> Name -> Q Dec
 makeMapComponentFor store comp = do
   let ct = pure $ ConT comp
       st = pure $ ConT store
-  head <$> [d| instance Component $ct where type Storage $ct = $st $ct |]
+      a = VarT $ mkName "a"
+  k <- reifyType comp
+  case k of
+    StarT -> head <$> [d| instance Component $ct where type Storage $ct = $st $ct |]
+    AppT (AppT ArrowT StarT) StarT ->
+      let ctf = (`AppT` a) <$> ct
+      in head <$> [d| instance Component $ctf where type Storage $ctf = $st $ctf |]
+    _ -> error "laksjdgflaj"
 
 makeMapComponentsFor :: Name -> [Name] -> Q [Dec]
 makeMapComponentsFor store = mapM (makeMapComponentFor store)
@@ -74,6 +127,12 @@ makeMapComponentsFor store = mapM (makeMapComponentFor store)
 makeWorldAndComponents :: String -> [Name] -> Q [Dec]
 makeWorldAndComponents worldName cTypes = do
   wdecls <- makeWorld worldName cTypes
+  cdecls <- makeMapComponents cTypes
+  return $ wdecls ++ cdecls
+
+makeWorldAndComponentsFixed :: String -> [Name] -> Q [Dec]
+makeWorldAndComponentsFixed worldName cTypes = do
+  wdecls <- makeWorldFixed worldName cTypes
   cdecls <- makeMapComponents cTypes
   return $ wdecls ++ cdecls
 
@@ -97,3 +156,6 @@ turns into
 -}
 makeWorld :: String -> [Name] -> Q [Dec]
 makeWorld worldName cTypes = makeWorldNoEC worldName (cTypes ++ [''EntityCounter])
+
+makeWorldFixed :: String -> [Name] -> Q [Dec]
+makeWorldFixed worldName cTypes = makeWorldFixedNoEC worldName (cTypes ++ [''EntityCounter])
